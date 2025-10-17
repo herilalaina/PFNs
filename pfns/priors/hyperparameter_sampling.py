@@ -261,7 +261,7 @@ def get_batch(
 
         batch.style = torch.cat([b.style for b in sub_batches], dim=0)
 
-        batch.y_style = batch.style
+        batch.y_style = None # batch.style
     return batch
 
 
