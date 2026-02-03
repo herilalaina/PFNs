@@ -3,11 +3,30 @@ import json
 import typing as tp
 from collections.abc import Sequence
 from dataclasses import fields, is_dataclass
+from functools import reduce
 from typing import ClassVar
 
 import yaml
 
 BaseTypes = tp.Union[str, int, float, bool, None, Sequence, dict]
+
+_CALLABLE_KEY = "__callable__"
+
+
+def _is_serializable_callable(v: tp.Any) -> bool:
+    """True if v is a callable we can serialize as module:qualname."""
+    if not callable(v) or isinstance(v, type):
+        return False
+    return hasattr(v, "__module__") and hasattr(v, "__qualname__")
+
+
+def _resolve_callable(path: str) -> tp.Callable[..., tp.Any]:
+    """Resolve 'module:qualname' to a callable. qualname may contain dots (e.g. Outer.method)."""
+    if ":" not in path:
+        raise ValueError(f"Expected 'module:qualname', got {path!r}")
+    module_path, _, qualname = path.partition(":")
+    mod = importlib.import_module(module_path)
+    return reduce(getattr, qualname.split("."), mod)
 
 
 class BaseConfig:
@@ -62,6 +81,8 @@ class BaseConfig:
                 return [process_value(item) for item in v]
             elif isinstance(v, dict):
                 return {k: process_value(val) for k, val in v.items()}
+            elif _is_serializable_callable(v):
+                return {_CALLABLE_KEY: f"{v.__module__}:{v.__qualname__}"}
             else:
                 return v
 
@@ -104,6 +125,8 @@ class BaseConfig:
             return [BaseConfig.from_dict(item) for item in data]
 
         # it is a dict
+        if _CALLABLE_KEY in data and len(data) == 1:
+            return _resolve_callable(data[_CALLABLE_KEY])
         if "__config_type__" not in data:
             return {k: BaseConfig.from_dict(v) for k, v in data.items()}
 
