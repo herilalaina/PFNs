@@ -80,6 +80,8 @@ def train(
     save_object_function: tp.Callable | None = None,  # defaults to torch.save
     load_object_function: tp.Callable | None = None,  # defaults to torch.load
     check_path_exists_function: tp.Callable | None = None,  # defaults to os.path.exists
+    # Callback invoked after each epoch: fn(model, epoch, device) -> optional dict of metrics
+    epoch_callback: tp.Callable | None = None,
 ):
     if reusable_config:
         round_tripped = c.from_yaml(c.to_yaml())
@@ -377,6 +379,16 @@ def train(
                     config=c,
                     save_function=save_object_function,
                 )
+
+            # Invoke epoch callback (e.g., downstream evaluation)
+            if epoch_callback is not None and rank == 0:
+                try:
+                    cb_result = epoch_callback(model, epoch, device)
+                    if cb_result and writer:
+                        for key, value in cb_result.items():
+                            writer.add_scalar(f"callback/{key}", value, epoch)
+                except Exception as e:
+                    print(f"Warning: epoch_callback failed at epoch {epoch}: {e}")
 
     except KeyboardInterrupt:
         print("Training interrupted by user.")
