@@ -496,10 +496,19 @@ def train_or_evaluate_epoch(
                         output, targets, criterion, c.n_targets_per_input
                     )  # shape: (batch_size, test_len)
 
+                    # Apply per-position loss weights if provided by the prior
+                    if hasattr(batch, 'loss_weights') and batch.loss_weights is not None:
+                        lw = batch.loss_weights.to(losses.device)
+                        # lw shape: (batch_size, test_len) — must match losses
+                        if lw.shape == losses.shape:
+                            per_seq_loss = (losses * lw).sum(1) / lw.sum(1).clamp(min=1e-8)
+                        else:
+                            per_seq_loss = losses.mean(1)
+                    else:
+                        per_seq_loss = losses.mean(1)
+
                     loss, nan_share = utils.torch_nanmean(
-                        losses.mean(
-                            1
-                        ),  # loss per sequence without nanmean, if any loss in a sequence is nan, the whole sequence is ignored
+                        per_seq_loss,  # loss per sequence without nanmean, if any loss in a sequence is nan, the whole sequence is ignored
                         return_nanshare=True,
                     )  # loss and nan_share are both scalar tensors
                     loss_scaled = loss / c.aggregate_k_gradients
