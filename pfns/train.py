@@ -382,13 +382,10 @@ def train(
 
             # Invoke epoch callback (e.g., downstream evaluation)
             if epoch_callback is not None and rank == 0:
-                try:
-                    cb_result = epoch_callback(model, epoch, device)
-                    if cb_result and writer:
-                        for key, value in cb_result.items():
-                            writer.add_scalar(f"callback/{key}", value, epoch)
-                except Exception as e:
-                    print(f"Warning: epoch_callback failed at epoch {epoch}: {e}")
+                cb_result = epoch_callback(model, epoch, device)
+                if cb_result and writer:
+                    for key, value in cb_result.items():
+                        writer.add_scalar(f"callback/{key}", value, epoch)
 
     except KeyboardInterrupt:
         print("Training interrupted by user.")
