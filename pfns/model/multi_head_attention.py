@@ -682,12 +682,19 @@ class MultiHeadAttention(torch.nn.Module):
                 TORCH_2_SUPPORTS_GQ = False
 
             if torch.cuda.is_available():
-                device = torch.cuda.current_device()
-                capability = torch.cuda.get_device_capability(device)
-                nvidia_compute_capability = f"{capability[0]}.{capability[1]}"
+                try:
+                    device = torch.cuda.current_device()
+                    capability = torch.cuda.get_device_capability(device)
+                    nvidia_compute_capability = f"{capability[0]}.{capability[1]}"
+                    USE_TORCH_2_GQA = (
+                        nvidia_compute_capability >= "8" and TORCH_2_SUPPORTS_GQ
+                    )
+                except Exception:
+                    # AMD GPUs (ROCm): capability check not meaningful,
+                    # enable GQA if torch supports it
+                    USE_TORCH_2_GQA = TORCH_2_SUPPORTS_GQ
             else:
-                nvidia_compute_capability = None
-            USE_TORCH_2_GQA = nvidia_compute_capability >= "8" and TORCH_2_SUPPORTS_GQ
+                USE_TORCH_2_GQA = False
 
             # TODO: add logging for something like this
             # if use_flash_attention and USE_TORCH_2_GQA:

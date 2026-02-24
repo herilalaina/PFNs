@@ -300,6 +300,25 @@ def print_on_master_only(is_master):
     __builtin__.print = print
 
 
+def _get_slurm_master_addr():
+    """Parse the first hostname from SLURM_NODELIST for multi-node communication."""
+    nodelist = os.environ.get("SLURM_NODELIST", "")
+    if not nodelist:
+        return "localhost"
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", nodelist],
+            capture_output=True,
+            text=True,
+        )
+        first_host = result.stdout.strip().split("\n")[0]
+        return first_host if first_host else "localhost"
+    except Exception:
+        return "localhost"
+
+
 def init_dist(device):
     print("init dist")
     if "LOCAL_RANK" in os.environ:
@@ -308,10 +327,12 @@ def init_dist(device):
         print("torch.distributed.launch and my rank is", rank)
         torch.cuda.set_device(rank)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+        if "ROCR_VISIBLE_DEVICES" not in os.environ:
+            os.environ["ROCR_VISIBLE_DEVICES"] = str(rank)
         torch.distributed.init_process_group(
             backend="nccl",
             init_method="env://",
-            timeout=datetime.timedelta(seconds=20),
+            timeout=datetime.timedelta(seconds=300),
             world_size=torch.cuda.device_count(),
             rank=rank,
         )
@@ -322,32 +343,43 @@ def init_dist(device):
             "only I can print, but when using print(..., force=True) it will print on all ranks."
         )
         return True, rank, f"cuda:{rank}"
-    elif "SLURM_PROCID" in os.environ and torch.cuda.device_count() > 1:
-        # this is for multi gpu when starting with submitit
+    elif "SLURM_PROCID" in os.environ and (
+        torch.cuda.device_count() > 1
+        or int(os.environ.get("SLURM_NTASKS", "1")) > 1
+    ):
+        # Multi-GPU via SLURM (srun): works on both NVIDIA and AMD (LUMI) clusters
         assert not device.startswith(
             "cpu"
         ), "Cannot use CPU for distributed training with SLURM"
         rank = int(os.environ["SLURM_PROCID"])
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        torch.cuda.set_device(rank)
-        # os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-        print("distributed submitit launch and my rank is", rank)
+        local_rank = int(os.environ.get("SLURM_LOCALID", rank))
+        world_size = int(os.environ.get("SLURM_NTASKS", torch.cuda.device_count()))
+
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = _get_slurm_master_addr()
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = "12355"
+
+        torch.cuda.set_device(local_rank)
+        print(
+            f"SLURM distributed launch: rank={rank}, local_rank={local_rank}, "
+            f"world_size={world_size}, master={os.environ['MASTER_ADDR']}"
+        )
         torch.distributed.init_process_group(
             backend="nccl",
             init_method="env://",
-            timeout=datetime.timedelta(seconds=20),
-            world_size=torch.cuda.device_count(),
+            timeout=datetime.timedelta(seconds=300),
+            world_size=world_size,
             rank=rank,
         )
         torch.distributed.barrier()
         print_on_master_only(rank == 0)
         print(
-            f"Distributed training on {torch.cuda.device_count()} GPUs, this is rank {rank}, "
+            f"Distributed training on {world_size} GPUs, this is rank {rank}, "
             "only I can print, but when using print(..., force=True) it will print on all ranks."
         )
 
-        return True, rank, f"cuda:{rank}"
+        return True, rank, f"cuda:{local_rank}"
     else:
         print("Not using distributed")
         # will not change any of the behavior of print, but allows putting the force=True in the print calls

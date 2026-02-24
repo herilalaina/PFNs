@@ -312,7 +312,10 @@ def train(
             epoch_time = time.time() - epoch_start_time
             if device.startswith("cuda"):
                 max_gpu_mem_gb = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
-                gpu_utilization = torch.cuda.utilization()
+                try:
+                    gpu_utilization = torch.cuda.utilization()
+                except Exception:
+                    gpu_utilization = None
             else:
                 max_gpu_mem_gb = None
                 gpu_utilization = None
@@ -498,9 +501,26 @@ def train_or_evaluate_epoch(
 
                     # Apply per-position loss weights if provided by the prior
                     if hasattr(batch, 'loss_weights') and batch.loss_weights is not None:
-                        lw = batch.loss_weights.to(losses.device)
-                        # lw shape: (batch_size, test_len) — must match losses
-                        if lw.shape == losses.shape:
+                        lw_spec = batch.loss_weights
+
+                        if isinstance(lw_spec, dict):
+                            # Deferred loss weights — computed from model's own output
+                            if lw_spec["mode"] == "pfn_ei" and training:
+                                with torch.no_grad():
+                                    ctx_y = batch.y[:, :single_eval_pos, 0].to(losses.device)
+                                    best_f = ctx_y.max(dim=1).values  # (B,)
+                                    best_f = best_f.unsqueeze(1).expand(-1, output.shape[1])  # (B, test_len)
+                                    ei = criterion.ei(output.detach(), best_f=best_f)  # (B, test_len)
+                                    ei = ei.clamp(min=0)
+                                    log_ei = torch.log(ei + 1e-8)
+                                    temp = lw_spec.get("temperature", 1.0)
+                                    lw = torch.softmax(log_ei / temp, dim=1) * ei.shape[1]
+                            else:
+                                lw = None  # unknown mode or not training → uniform
+                        else:
+                            lw = lw_spec.to(losses.device)  # existing Tensor path
+
+                        if lw is not None and lw.shape == losses.shape:
                             per_seq_loss = (losses * lw).sum(1) / lw.sum(1).clamp(min=1e-8)
                         else:
                             per_seq_loss = losses.mean(1)
