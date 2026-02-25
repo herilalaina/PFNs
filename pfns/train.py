@@ -240,10 +240,13 @@ def train(
 
     if using_dist:
         print("Distributed training")
+        # Use the actual cuda device index (not global rank) — when
+        # ROCR_VISIBLE_DEVICES isolates one GPU per task, device is "cuda:0".
+        cuda_device_idx = torch.cuda.current_device()
         model = torch.nn.parallel.DistributedDataParallel(
             model,
-            device_ids=[rank],
-            output_device=rank,
+            device_ids=[cuda_device_idx],
+            output_device=cuda_device_idx,
             broadcast_buffers=False,
         )
 
