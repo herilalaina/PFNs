@@ -365,8 +365,10 @@ def init_dist(device):
             f"SLURM distributed launch: rank={rank}, local_rank={local_rank}, "
             f"world_size={world_size}, master={os.environ['MASTER_ADDR']}"
         )
+        ddp_backend = os.environ.get("PFNLLREG_DDP_BACKEND", "nccl")
+        print(f"Using DDP backend: {ddp_backend}")
         torch.distributed.init_process_group(
-            backend="nccl",
+            backend=ddp_backend,
             init_method="env://",
             timeout=datetime.timedelta(seconds=300),
             world_size=world_size,

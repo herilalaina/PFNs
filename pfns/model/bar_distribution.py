@@ -767,6 +767,43 @@ class FullSupportBarDistribution(BarDistribution):
         p = torch.softmax(logits, -1)
         return torch.einsum("...b,...b->...", p, bucket_contributions)
 
+    def soft_ei(
+        self,
+        logits: torch.Tensor,
+        best_f: torch.Tensor | float,
+        *,
+        maximize: bool = True,
+        beta: float = 1.0,
+    ) -> torch.Tensor:
+        """Softplus-based EI — always positive, differentiable, no log(0) issues.
+
+        Uses softplus(bucket_center - best_f) instead of max(0, ...) so that
+        log(soft_ei) is always finite. This enables the EULBO auxiliary loss.
+
+        Args:
+            logits: (..., num_bars) model output (WITH gradients)
+            best_f: best observed value
+            maximize: whether to maximize
+            beta: softplus sharpness (default 1.0)
+
+        Returns:
+            soft_ei values of shape (...), strictly > 0
+        """
+        assert maximize
+        if not torch.is_tensor(best_f) or not len(best_f.shape):
+            best_f = torch.full(logits[..., 0].shape, best_f, device=logits.device)
+
+        bucket_centers = self.borders[:-1] + self.bucket_widths / 2  # (num_bars,)
+
+        # softplus(bucket_center - best_f) per bucket per sample
+        # best_f: (...), bucket_centers: (num_bars,)
+        improvement = bucket_centers - best_f[..., None]  # (..., num_bars)
+        soft_improvement = torch.nn.functional.softplus(improvement, beta=beta)
+
+        # Weight by probabilities (WITH gradients through softmax)
+        p = torch.softmax(logits, -1)  # (..., num_bars)
+        return (p * soft_improvement).sum(-1)
+
     def cdf(self, logits: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
         """Cumulative distribution function.
 

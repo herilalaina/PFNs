@@ -4,8 +4,11 @@ from typing import Literal
 
 from pfns import base_config
 from pfns.model import encoders, transformer
-from pfns.model.bar_distribution import BarDistribution
-from pfns.model.criterions import BarDistributionConfig, CrossEntropyConfig
+from pfns.model.criterions import (
+    BarDistributionConfig,
+    CrossEntropyConfig,
+    GMMDistributionConfig,
+)
 from pfns.model.encoders import StyleEncoderConfig
 
 from torch import nn
@@ -13,7 +16,7 @@ from torch import nn
 
 @dataclass(frozen=True)
 class TransformerConfig(base_config.BaseConfig):
-    criterion: CrossEntropyConfig | BarDistributionConfig
+    criterion: CrossEntropyConfig | BarDistributionConfig | GMMDistributionConfig
     encoder: tp.Optional[encoders.EncoderConfig] = (
         None  # todo add back in as config, currently only supporting standard encoder
     )
@@ -43,7 +46,7 @@ class TransformerConfig(base_config.BaseConfig):
         criterion = self.criterion.get_criterion()
 
         # Determine n_out based on the resolved criterion
-        if isinstance(criterion, BarDistribution):
+        if hasattr(criterion, "num_bars"):
             n_out = criterion.num_bars
         elif isinstance(criterion, nn.CrossEntropyLoss):
             n_out = criterion.weight.shape[0]

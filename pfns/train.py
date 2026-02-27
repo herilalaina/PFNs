@@ -503,9 +503,9 @@ def train_or_evaluate_epoch(
                     )  # shape: (batch_size, test_len)
 
                     # Apply per-position loss weights if provided by the prior
+                    _eulbo_aux_loss = None
                     if hasattr(batch, 'loss_weights') and batch.loss_weights is not None:
                         lw_spec = batch.loss_weights
-
                         if isinstance(lw_spec, dict):
                             # Deferred loss weights — computed from model's own output
                             if lw_spec["mode"] == "pfn_ei" and training:
@@ -518,6 +518,17 @@ def train_or_evaluate_epoch(
                                     log_ei = torch.log(ei + 1e-8)
                                     temp = lw_spec.get("temperature", 1.0)
                                     lw = torch.softmax(log_ei / temp, dim=1) * ei.shape[1]
+                            elif lw_spec["mode"] == "eulbo" and training:
+                                # EULBO: NLL uses uniform weights, but add auxiliary
+                                # loss -lambda * log(soft_ei) with live gradients
+                                ctx_y = batch.y[:, :single_eval_pos, 0].to(losses.device)
+                                best_f = ctx_y.max(dim=1).values  # (B,)
+                                best_f = best_f.unsqueeze(1).expand(-1, output.shape[1])  # (B, test_len)
+                                # soft_ei WITH gradients through output
+                                sei = criterion.soft_ei(output, best_f=best_f)  # (B, test_len)
+                                eulbo_lambda = lw_spec.get("lambda", 0.01)
+                                _eulbo_aux_loss = -eulbo_lambda * torch.log(sei).mean()
+                                lw = None  # NLL uses uniform weights
                             else:
                                 lw = None  # unknown mode or not training → uniform
                         else:
@@ -535,6 +546,10 @@ def train_or_evaluate_epoch(
                         return_nanshare=True,
                     )  # loss and nan_share are both scalar tensors
                     loss_scaled = loss / c.aggregate_k_gradients
+
+                    # Add EULBO auxiliary loss if present
+                    if _eulbo_aux_loss is not None:
+                        loss_scaled = loss_scaled + _eulbo_aux_loss / c.aggregate_k_gradients
 
                 if scaler:
                     loss_scaled = scaler.scale(loss_scaled)
