@@ -332,7 +332,7 @@ def init_dist(device):
         torch.distributed.init_process_group(
             backend="nccl",
             init_method="env://",
-            timeout=datetime.timedelta(seconds=300),
+            timeout=datetime.timedelta(seconds=1800),
             world_size=torch.cuda.device_count(),
             rank=rank,
         )
@@ -370,7 +370,7 @@ def init_dist(device):
         torch.distributed.init_process_group(
             backend=ddp_backend,
             init_method="env://",
-            timeout=datetime.timedelta(seconds=300),
+            timeout=datetime.timedelta(seconds=1800),
             world_size=world_size,
             rank=rank,
         )

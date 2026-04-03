@@ -5,6 +5,7 @@ import torch.nn as nn
 from pfns import base_config
 
 from .bar_distribution import BarDistributionConfig
+from .gaussian_distribution import GaussianDistributionConfig
 from .gmm_distribution import GMMDistributionConfig
 
 
@@ -19,4 +20,4 @@ class CrossEntropyConfig(base_config.BaseConfig):
         )
 
 
-__all__ = ["BarDistributionConfig", "CrossEntropyConfig", "GMMDistributionConfig"]
+__all__ = ["BarDistributionConfig", "CrossEntropyConfig", "GaussianDistributionConfig", "GMMDistributionConfig"]

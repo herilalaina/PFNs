@@ -20,6 +20,48 @@ try:
 except ImportError:
     HAVE_FLASH_ATTN = False
 
+try:
+    from entmax import entmax15
+
+    HAVE_ENTMAX = True
+except ImportError:
+    HAVE_ENTMAX = False
+
+
+class QASSMax(torch.nn.Module):
+    """Query-aware scalable softmax (from TabICL).
+
+    Scales query vectors by a learned function of log(context_length),
+    modulated per-query via a small MLP.  This improves attention stability
+    when context length varies significantly.
+
+    Expects queries in PFN MHA layout: (b, q, h, d).
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, n_hidden: int = 64,
+                 device=None, dtype=None):
+        super().__init__()
+        self.base_mlp = torch.nn.Sequential(
+            torch.nn.Linear(1, n_hidden, device=device, dtype=dtype),
+            torch.nn.GELU(),
+            torch.nn.Linear(n_hidden, num_heads * head_dim, device=device, dtype=dtype),
+        )
+        self.query_mlp = torch.nn.Sequential(
+            torch.nn.Linear(head_dim, n_hidden, device=device, dtype=dtype),
+            torch.nn.GELU(),
+            torch.nn.Linear(n_hidden, head_dim, device=device, dtype=dtype),
+        )
+        # Init query_mlp output to zero so QASSMax starts as identity-like
+        torch.nn.init.zeros_(self.query_mlp[-1].weight)
+        torch.nn.init.zeros_(self.query_mlp[-1].bias)
+
+    def forward(self, q: torch.Tensor, n: int) -> torch.Tensor:
+        """q: (b, seq, heads, head_dim), n: context length (key seq len)."""
+        b, seq_len, num_heads, head_dim = q.shape
+        logn = q.new_tensor(math.log(max(1, n))).view(1, 1)
+        base = self.base_mlp(logn).view(1, 1, num_heads, head_dim)
+        return base * (1 + torch.tanh(self.query_mlp(q))) * q
+
 
 def apply_rope(x, rope_vals):
     # x has shape [b,s,h,d]
@@ -209,6 +251,7 @@ class MultiHeadAttention(torch.nn.Module):
         positions_base: float = 0.02,
         positions_num_measures: int = 0,
         dont_look_at_yourself: bool = False,
+        attention_fn: str = "softmax",
     ):
         super().__init__()
         assert nhead % share_kv_across_n_heads == 0
@@ -224,6 +267,24 @@ class MultiHeadAttention(torch.nn.Module):
         self.softmax_scale = softmax_scale
         self.recompute = recompute
         self.init_gain = init_gain
+        self.attention_fn = attention_fn
+
+        if attention_fn == "asentmax":
+            assert HAVE_ENTMAX, "pip install entmax required for asentmax"
+            # ASEntmax per-head learnable temperature: delta + beta * (log n)^gamma
+            self.asentmax_delta = torch.nn.Parameter(
+                torch.ones(nhead, device=device, dtype=dtype)
+            )
+            self.asentmax_beta = torch.nn.Parameter(
+                torch.zeros(nhead, device=device, dtype=dtype)
+            )
+            self.asentmax_gamma = torch.nn.Parameter(
+                torch.ones(nhead, device=device, dtype=dtype)
+            )
+        elif attention_fn == "qassmax":
+            self.qassmax_layer = QASSMax(
+                num_heads=nhead, head_dim=d_k, device=device, dtype=dtype,
+            )
 
         self.positions_base = positions_base
         assert (positions_num_measures + 1) <= self._d_k == self._d_v, (
@@ -604,8 +665,8 @@ class MultiHeadAttention(torch.nn.Module):
         )
         return kv.reshape(*kv.shape[:-3], nhead * share_kv_across_n_heads, d)
 
-    @staticmethod
     def compute_attention_heads(  # noqa: C901, PLR0912
+        self,
         q: torch.Tensor | None,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -654,10 +715,9 @@ class MultiHeadAttention(torch.nn.Module):
         )
 
         # this string comparison is reliable, as it does not compare to a subversion
-        TORCH_2_ATTENTION_POSSIBLE = (
-            torch.__version__ >= "2" and torch.cuda.is_available()
-        )
-        if positions_num_measures > 0:
+        TORCH_2_ATTENTION_POSSIBLE = torch.__version__ >= "2"
+        attention_fn = getattr(self, "attention_fn", "softmax")
+        if positions_num_measures > 0 or attention_fn != "softmax":
             TORCH_2_ATTENTION_POSSIBLE = False
             use_flash_attention = False
 
@@ -813,6 +873,9 @@ class MultiHeadAttention(torch.nn.Module):
             v = MultiHeadAttention.broadcast_kv_across_heads(
                 v, share_kv_across_n_heads
             )  # [b,k,h,d]
+            # QASSMax: scale queries by learned function of log(context_length)
+            if getattr(self, "attention_fn", "softmax") == "qassmax":
+                q = self.qassmax_layer(q, n=seqlen_kv)
             # Prototype: compute pairwise distance metrics without modifying attention
             if positions_num_measures > 0:
                 assert (
@@ -864,7 +927,19 @@ class MultiHeadAttention(torch.nn.Module):
                 if softmax_scale is None
                 else softmax_scale
             )
-            ps = torch.softmax(logits, dim=2)
+            attention_fn = getattr(self, "attention_fn", "softmax")
+            if attention_fn == "asentmax":
+                # ASEntmax: scale logits by learned length-dependent temperature
+                # temp_h = delta + beta * (log n)^gamma, per head
+                log_n = math.log(max(seqlen_kv, 2))
+                temp = (
+                    self.asentmax_delta
+                    + self.asentmax_beta * (log_n ** self.asentmax_gamma)
+                )  # (nhead,)
+                scaled_logits = logits * temp[None, None, None, :]  # [b,q,k,h]
+                ps = entmax15(scaled_logits, dim=2)
+            else:
+                ps = torch.softmax(logits, dim=2)
             ps = torch.dropout(ps, dropout_p, train=True)
             if positions_num_measures > 0:
                 attention_head_outputs = torch.einsum(

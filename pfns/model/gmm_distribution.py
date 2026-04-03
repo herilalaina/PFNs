@@ -227,6 +227,63 @@ class GMMDistribution(nn.Module):
 
         return (weights * soft_ei_per_component).sum(-1)
 
+    def expected_log_utility(
+        self,
+        logits: torch.Tensor,
+        best_f: float | torch.Tensor,
+        *,
+        maximize: bool = True,
+        beta: float = 1.0,
+        n_quad: int = 20,
+    ) -> torch.Tensor:
+        """E[log(softplus(f - best_f))] under GMM predictive (EULBO).
+
+        Uses Gauss-Hermite quadrature per component, then mixture-weighted sum.
+        The log is INSIDE the expectation, as in Moss et al. (2024).
+
+        Args:
+            logits: (..., 3*K) model output (WITH gradients)
+            best_f: best observed value
+            maximize: whether to maximize
+            beta: softplus sharpness (default 1.0)
+            n_quad: number of Gauss-Hermite quadrature points
+
+        Returns:
+            Expected log-utility of shape (...)
+        """
+        assert maximize
+        means, stds, log_weights = self._parse_logits(logits)
+        weights = torch.exp(log_weights)  # (..., K)
+
+        if not torch.is_tensor(best_f) or not len(best_f.shape):
+            best_f = torch.full(
+                logits[..., 0].shape, best_f, device=logits.device
+            )
+
+        # Constant quadrature nodes/weights (not differentiable, just constants)
+        import numpy as np
+        gh_nodes_np, gh_weights_np = np.polynomial.hermite.hermgauss(n_quad)
+        gh_nodes = torch.as_tensor(gh_nodes_np, dtype=logits.dtype, device=logits.device)
+        gh_weights = torch.as_tensor(gh_weights_np, dtype=logits.dtype, device=logits.device)
+
+        # For each component k: E_{N(mu_k, s_k^2)}[log(softplus(f - best_f))]
+        # f = mu_k + s_k * sqrt(2) * node
+        # means: (..., K), stds: (..., K), gh_nodes: (Q,)
+        f_samples = (
+            means.unsqueeze(-1)
+            + stds.unsqueeze(-1) * math.sqrt(2) * gh_nodes
+        )  # (..., K, Q)
+        improvement = f_samples - best_f[..., None, None]  # (..., K, Q)
+        log_utility = torch.log(
+            torch.nn.functional.softplus(improvement, beta=beta)
+        )  # (..., K, Q)
+
+        # GH quadrature per component: (1/sqrt(pi)) * sum_q w_q * log_utility
+        elu_per_component = (gh_weights * log_utility).sum(-1) / math.sqrt(math.pi)  # (..., K)
+
+        # Mixture-weighted sum
+        return (weights * elu_per_component).sum(-1)
+
     def pi(
         self,
         logits: torch.Tensor,

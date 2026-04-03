@@ -73,6 +73,8 @@ class TableTransformer(nn.Module):
         rope_multiplier: float = 1,
         positions_num_measures: int = 0,
         x_only_mode: bool = False,
+        attention_fn: str = "softmax",
+        attention_fn_items: str | None = None,
         **layer_kwargs: Any,
     ):
         """Initializes the PerFeatureTransformer module.
@@ -167,6 +169,8 @@ class TableTransformer(nn.Module):
         self.use_rope = use_rope
         self.rope_multiplier = rope_multiplier
         self.positions_num_measures = positions_num_measures
+        self.attention_fn = attention_fn
+        self.attention_fn_items = attention_fn_items
 
         def layer_creator():
             return PerFeatureLayer(
@@ -180,6 +184,8 @@ class TableTransformer(nn.Module):
                 ),
                 attention_between_features=attention_between_features,
                 positions_num_measures=positions_num_measures,
+                attention_fn=attention_fn,
+                attention_fn_items=attention_fn_items,
                 **layer_kwargs,
             )
 

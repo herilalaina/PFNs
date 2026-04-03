@@ -386,6 +386,42 @@ class BarDistribution(nn.Module):
         p = torch.softmax(logits, -1)
         return torch.einsum("...b,...b->...", p, bucket_contributions)
 
+    def log_ei(
+        self,
+        logits: torch.Tensor,
+        best_f: float | torch.Tensor,
+        *,
+        maximize: bool = True,
+    ) -> torch.Tensor:
+        """Log Expected Improvement (numerically stable).
+
+        log(EI) = logsumexp(log_softmax(logits) + log(bucket_contributions))
+
+        Buckets where bucket_contributions <= 0 (i.e. best_f above the bucket)
+        are masked to -inf so they don't contribute.
+        """
+        bucket_diffs = self.borders[1:] - self.borders[:-1]
+        assert maximize
+        if not torch.is_tensor(best_f) or not len(best_f.shape):  # type: ignore
+            best_f = torch.full(logits[..., 0].shape, best_f, device=logits.device)  # type: ignore
+
+        best_f = best_f[..., None].repeat(*[1] * len(best_f.shape), logits.shape[-1])  # type: ignore
+        clamped_best_f = best_f.clamp(self.borders[:-1], self.borders[1:])
+
+        bucket_contributions = (
+            (self.borders[1:] ** 2 - clamped_best_f**2) / 2
+            - best_f * (self.borders[1:] - clamped_best_f)
+        ) / bucket_diffs
+
+        log_p = torch.log_softmax(logits, -1)
+        # Mask zero-contribution buckets (best_f >= bucket upper border)
+        log_contrib = torch.where(
+            bucket_contributions > 0,
+            torch.log(bucket_contributions),
+            torch.tensor(float("-inf"), device=logits.device),
+        )
+        return torch.logsumexp(log_p + log_contrib, dim=-1)
+
     def pi(
         self,
         logits: torch.Tensor,
@@ -435,6 +471,44 @@ class BarDistribution(nn.Module):
 
     def variance(self, logits: torch.Tensor) -> torch.Tensor:
         return self.mean_of_square(logits) - self.mean(logits).square()
+
+    def expected_log_utility(
+        self,
+        logits: torch.Tensor,
+        best_f: torch.Tensor | float,
+        *,
+        maximize: bool = True,
+        beta: float = 1.0,
+    ) -> torch.Tensor:
+        """E[log(softplus(f - best_f))] under the bar distribution (EULBO).
+
+        Computes sum_k p_k * log(softplus(center_k - best_f)), which is the
+        correct EULBO utility term from Moss et al. (2024). The log is INSIDE
+        the expectation, giving bounded gradients unlike log(E[softplus(...)]).
+
+        Args:
+            logits: (..., num_bars) model output (WITH gradients)
+            best_f: best observed value
+            maximize: whether to maximize
+            beta: softplus sharpness (default 1.0)
+
+        Returns:
+            Expected log-utility of shape (...)
+        """
+        assert maximize
+        if not torch.is_tensor(best_f) or not len(best_f.shape):
+            best_f = torch.full(logits[..., 0].shape, best_f, device=logits.device)
+
+        bucket_centers = self.borders[:-1] + self.bucket_widths / 2  # (num_bars,)
+        improvement = bucket_centers - best_f[..., None]  # (..., num_bars)
+
+        # log(softplus(x)) — well-behaved for all x, no numerical issues
+        log_soft_improvement = torch.log(
+            torch.nn.functional.softplus(improvement, beta=beta)
+        )
+
+        p = torch.softmax(logits, -1)  # (..., num_bars)
+        return (p * log_soft_improvement).sum(-1)
 
     # TODO: Move into standalone module for plotting
     def plot(
@@ -766,6 +840,66 @@ class FullSupportBarDistribution(BarDistribution):
 
         p = torch.softmax(logits, -1)
         return torch.einsum("...b,...b->...", p, bucket_contributions)
+
+    @override
+    def log_ei(
+        self,
+        logits: torch.Tensor,
+        best_f: torch.Tensor | float,
+        *,
+        maximize: bool = True,
+    ) -> torch.Tensor:
+        """Log Expected Improvement for FullSupportBarDistribution.
+
+        Same as parent log_ei but with half-normal side contributions
+        for the first and last buckets (continuous support).
+        """
+        bucket_diffs = self.borders[1:] - self.borders[:-1]
+        assert maximize
+        if not torch.is_tensor(best_f) or not len(best_f.shape):  # type: ignore
+            best_f = torch.full(logits[..., 0].shape, best_f, device=logits.device)  # type: ignore
+
+        assert best_f.shape == logits[..., 0].shape, (  # type: ignore
+            f"best_f.shape: {best_f.shape}, logits.shape: {logits.shape}"  # type: ignore
+        )
+
+        best_f_per_logit = best_f[..., None].repeat(  # type: ignore
+            *[1] * len(best_f.shape),  # type: ignore
+            logits.shape[-1],
+        )
+        clamped_best_f = best_f_per_logit.clamp(self.borders[:-1], self.borders[1:])
+
+        bucket_contributions = (
+            (self.borders[1:] ** 2 - clamped_best_f**2) / 2
+            - best_f_per_logit * (self.borders[1:] - clamped_best_f)
+        ) / bucket_diffs
+
+        # Half-normal side contributions (same as ei())
+        side_normals = (
+            self.halfnormal_with_p_weight_before(self.bucket_widths[0]),
+            self.halfnormal_with_p_weight_before(self.bucket_widths[-1]),
+        )
+        position_in_side_normals = (
+            -(best_f - self.borders[1]).clamp(max=0.0),
+            (best_f - self.borders[-2]).clamp(min=0.0),
+        )
+
+        bucket_contributions[..., -1] = self.ei_for_halfnormal(
+            side_normals[1].scale,
+            position_in_side_normals[1],
+        )
+        bucket_contributions[..., 0] = self.ei_for_halfnormal(
+            side_normals[0].scale,
+            torch.zeros_like(position_in_side_normals[0]),
+        ) - self.ei_for_halfnormal(side_normals[0].scale, position_in_side_normals[0])
+
+        log_p = torch.log_softmax(logits, -1)
+        log_contrib = torch.where(
+            bucket_contributions > 0,
+            torch.log(bucket_contributions),
+            torch.tensor(float("-inf"), device=logits.device),
+        )
+        return torch.logsumexp(log_p + log_contrib, dim=-1)
 
     def soft_ei(
         self,

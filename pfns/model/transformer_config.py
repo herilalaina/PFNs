@@ -7,6 +7,7 @@ from pfns.model import encoders, transformer
 from pfns.model.criterions import (
     BarDistributionConfig,
     CrossEntropyConfig,
+    GaussianDistributionConfig,
     GMMDistributionConfig,
 )
 from pfns.model.encoders import StyleEncoderConfig
@@ -16,7 +17,7 @@ from torch import nn
 
 @dataclass(frozen=True)
 class TransformerConfig(base_config.BaseConfig):
-    criterion: CrossEntropyConfig | BarDistributionConfig | GMMDistributionConfig
+    criterion: CrossEntropyConfig | BarDistributionConfig | GaussianDistributionConfig | GMMDistributionConfig
     encoder: tp.Optional[encoders.EncoderConfig] = (
         None  # todo add back in as config, currently only supporting standard encoder
     )
@@ -40,6 +41,8 @@ class TransformerConfig(base_config.BaseConfig):
     rope_multiplier: float = 1
     positions_num_measures: int = 0
     x_only_mode: bool = False
+    attention_fn: str = "softmax"
+    attention_fn_items: str | None = None  # if set, overrides attention_fn for item (example) attention only
 
     def create_model(self) -> transformer.TableTransformer:
         # Resolve criterion
@@ -99,6 +102,8 @@ class TransformerConfig(base_config.BaseConfig):
             rope_multiplier=self.rope_multiplier,
             positions_num_measures=self.positions_num_measures,
             x_only_mode=self.x_only_mode,
+            attention_fn=self.attention_fn,
+            attention_fn_items=self.attention_fn_items,
             **(self.model_extra_args or {}),
         )
         model.criterion = criterion

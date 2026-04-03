@@ -54,6 +54,8 @@ class PerFeatureLayer(Module):
         positions_num_measures: int = 0,
         positions_base: float = 0.02,
         dont_look_at_yourself: bool = False,
+        attention_fn: str = "softmax",
+        attention_fn_items: str | None = None,
     ) -> None:
         """
         Args:
@@ -113,6 +115,7 @@ class PerFeatureLayer(Module):
                 initialize_output_to_zero=zero_init,
                 recompute=recompute_sublayers,
                 init_gain=attention_init_gain,
+                attention_fn=attention_fn,
             )
 
         if isinstance(precomputed_kv, tuple):
@@ -139,6 +142,7 @@ class PerFeatureLayer(Module):
             positions_base=positions_base,
             positions_num_measures=positions_num_measures,
             dont_look_at_yourself=dont_look_at_yourself,
+            attention_fn=attention_fn_items or attention_fn,
         )
         self.positions_num_measures = positions_num_measures
 

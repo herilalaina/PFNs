@@ -519,16 +519,36 @@ def train_or_evaluate_epoch(
                                     temp = lw_spec.get("temperature", 1.0)
                                     lw = torch.softmax(log_ei / temp, dim=1) * ei.shape[1]
                             elif lw_spec["mode"] == "eulbo" and training:
-                                # EULBO: NLL uses uniform weights, but add auxiliary
-                                # loss -lambda * log(soft_ei) with live gradients
+                                # EULBO (Moss et al. 2024): NLL + λ * E[log(softplus(f - y*))]
+                                # The log is INSIDE the expectation (bounded gradients).
+                                # Lambda is needed because the paper's equal weighting assumes
+                                # SVGP where ELBO sums over N observations vs 1 utility term.
+                                # In PFN training both are per-position means, so λ < 1.0
+                                # re-balances the utility term (λ ≈ 1/N_context).
                                 ctx_y = batch.y[:, :single_eval_pos, 0].to(losses.device)
                                 best_f = ctx_y.max(dim=1).values  # (B,)
                                 best_f = best_f.unsqueeze(1).expand(-1, output.shape[1])  # (B, test_len)
-                                # soft_ei WITH gradients through output
-                                sei = criterion.soft_ei(output, best_f=best_f)  # (B, test_len)
+                                # E[log(softplus(f - best_f))] WITH gradients
+                                elu = criterion.expected_log_utility(output, best_f=best_f)  # (B, test_len)
                                 eulbo_lambda = lw_spec.get("lambda", 0.01)
-                                _eulbo_aux_loss = -eulbo_lambda * torch.log(sei).mean()
+                                _eulbo_aux_loss = -eulbo_lambda * elu.mean()
                                 lw = None  # NLL uses uniform weights
+                            elif lw_spec["mode"] == "loss_calibrated":
+                                # Loss-calibrated NLL (Lacoste-Julien et al. 2011).
+                                # Weight NLL by u(f(x*)) to learn the tilted predictive
+                                # p̃(y*|x*,D) ∝ p(y*|x*,D) · E[u(f(x*))|D,y*].
+                                # Uses noiseless f_true when available, falls back to y.
+                                if hasattr(batch, 'f_true') and batch.f_true is not None:
+                                    f_ctx = batch.f_true[:, :single_eval_pos, 0].to(losses.device)
+                                    f_test = batch.f_true[:, single_eval_pos:, 0].to(losses.device)
+                                else:
+                                    f_ctx = batch.y[:, :single_eval_pos, 0].to(losses.device)
+                                    f_test = batch.target_y[:, single_eval_pos:, 0].to(losses.device)
+                                best_f = f_ctx.max(dim=1).values.unsqueeze(1)  # (B, 1)
+                                # u(f(x*)) = softplus(f(x*) - best_f)
+                                raw_w = torch.nn.functional.softplus(f_test - best_f)  # (B, test_len)
+                                # Self-normalized importance weights (sum to test_len per seq)
+                                lw = raw_w / raw_w.mean(dim=1, keepdim=True).clamp(min=1e-8)
                             else:
                                 lw = None  # unknown mode or not training → uniform
                         else:

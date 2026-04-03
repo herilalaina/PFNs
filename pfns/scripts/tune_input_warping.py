@@ -6,12 +6,52 @@ import numpy as np
 import scipy
 import torch
 
-from botorch.optim import module_to_array, set_params_with_array
+try:
+    from botorch.optim import module_to_array, set_params_with_array
+except ImportError:
+    # Compatibility shim for BoTorch >= 0.12 where these were removed
+    from collections import OrderedDict as _OD
+
+    def module_to_array(module, bounds=None, exclude=None):
+        """Extract module parameters into a flat numpy array."""
+        if bounds is None:
+            bounds = {}
+        property_dict = _OD()
+        params_list = []
+        lower_bounds = []
+        upper_bounds = []
+        for name, param in module.named_parameters():
+            if exclude and name in exclude:
+                continue
+            property_dict[name] = param.shape
+            params_list.append(param.detach().cpu().view(-1).double().numpy())
+            n = param.numel()
+            if name in bounds:
+                lb, ub = bounds[name]
+                lower_bounds.extend([lb] * n)
+                upper_bounds.extend([ub] * n)
+            else:
+                lower_bounds.extend([-float("inf")] * n)
+                upper_bounds.extend([float("inf")] * n)
+        params = np.concatenate(params_list) if params_list else np.array([])
+        return params, property_dict, (np.array(lower_bounds), np.array(upper_bounds))
+
+    def set_params_with_array(module, x, property_dict):
+        """Set module parameters from a flat numpy array."""
+        idx = 0
+        param_dict = dict(module.named_parameters())
+        for name, shape in property_dict.items():
+            n = int(np.prod(shape))
+            param_dict[name].data = torch.tensor(
+                x[idx : idx + n], dtype=param_dict[name].dtype, device=param_dict[name].device
+            ).reshape(shape)
+            idx += n
+        return module
 from gpytorch.priors import LogNormalPrior
 from scipy.optimize import Bounds
 
 from .. import utils
-from ..priors.hebo_prior import Warp
+from botorch.models.transforms.input import Warp
 
 device = "cpu"
 
@@ -40,7 +80,7 @@ def fit_lbfgs(x, w, nll, num_grad_steps=10, ignore_prior=True, params0=None):
             for _name, module, prior, closure, _ in w.named_priors():
                 prior_term = prior.log_prob(closure(module))
                 loss -= prior_term.sum(dim=-1)
-        negll = nll(w(x.to(torch.float64)).to(torch.float)).sum()
+        negll = nll(w(x)).sum()
         # if loss != 0.:
         #    print(loss.item(), negll.item())
         loss = loss + negll
@@ -181,10 +221,16 @@ def fit_input_warping(
     device = x.device
     assert y.device == device, y.device
 
+    # Convert model and data to float64 for warp fitting (scipy uses float64)
+    model = model.double()
+    x = x.double()
+    y = y.double()
     model.requires_grad_(False)
 
+    d = x.shape[1]
     w = Warp(
-        range(x.shape[1]),
+        d=d,
+        indices=list(range(d)),
         concentration1_prior=LogNormalPrior(
             torch.tensor(0.0, device=device), torch.tensor(0.75, device=device)
         ),
@@ -193,7 +239,7 @@ def fit_input_warping(
         ),
         eps=1e-12,
     )
-    w.to(device)
+    w.to(device=device, dtype=torch.float64)
 
     def fast_nll(x):  # noqa actually used with `eval` below
         model.requires_grad_(False)
@@ -205,14 +251,43 @@ def fit_input_warping(
         else:
             style = None
         logits = model(
-            x[:, None],
-            y[:, None],
-            x[:, None],
+            x[None],
+            y[None],
+            x[None],
             style=style,
             only_return_standard_out=True,
         )
-        loss = model.criterion(logits, y[:, None]).squeeze(1)
+        loss = model.criterion(logits, y[None]).squeeze(1)
         return loss
+
+    def loo_nll(x):  # noqa actually used with `eval` below
+        """Batched leave-one-out NLL. Single forward pass.
+
+        Creates n batch elements where batch i uses all points except i
+        as training context and predicts point i.
+        x: (n, d), y: (n, 1) from outer scope.
+        Model expects batch_first: (batch, seq, features).
+        """
+        model.requires_grad_(False)
+        n = x.shape[0]
+        # Build LOO train sets: for each i, drop row i
+        # idx[i] = [0,..,i-1, i+1,..,n-1], shape (n, n-1)
+        idx = torch.stack([
+            torch.cat([torch.arange(i, device=x.device),
+                        torch.arange(i + 1, n, device=x.device)])
+            for i in range(n)
+        ])  # (n, n-1)
+        train_x = x[idx]          # (n, n-1, d) = (batch, seq_train, d)
+        train_y = y[idx]          # (n, n-1, 1) = (batch, seq_train, 1)
+        eval_x = x.unsqueeze(1)   # (n, 1, d)   = (batch, seq_test=1, d)
+        eval_y = y.unsqueeze(1)   # (n, 1, 1)   = (batch, seq_test=1, 1)
+
+        logits = model(
+            train_x, train_y, eval_x,
+            only_return_standard_out=True,
+        )
+        loss = model.criterion(logits, eval_y)  # (n, 1) or (1, n)
+        return loss.sum()
 
     def true_nll(x):  # noqa actually used with `eval` below
         assert (
